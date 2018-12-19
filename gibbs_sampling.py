@@ -1,13 +1,16 @@
 import os, random, string
 import operator
 import numpy as np
+from frozendict import OrderedDict
 from functools import reduce
 BASE_DIR = os.path.join(os.path.dirname(__file__), "data_files")
 COG160 = os.path.join(BASE_DIR, "COG160.fasta")
+SUB_SEQ_FILE = os.path.join(BASE_DIR, "best_seq.txt")
+MODEL_FILE = os.path.join(BASE_DIR, "model_file.txt")
 K = 4
-
-def prod(factors):
-    return reduce(operator.mul, factors, 1)
+SPLITS = 2
+TOTAL_SPLIT_ITERATIONS = 100
+TOTAL_ITERATIONS = 100
 
 def cog_get_data(cog_file):
 
@@ -25,94 +28,194 @@ def cog_get_data(cog_file):
     return data_output
 
 
-cog160 = cog_get_data(COG160)
+def prod(factors):
+    return reduce(operator.mul, factors, 1)
 
 
-def get_background_probabilities(dataset=cog160):
-    string_set = "".join(dataset)
-    return {c: (string_set.count(c) + 1) / (len(string_set) + 20) for c in set(list(string_set))}
+def _split(seqs, n):
+    k, m = divmod(len(seqs), n)
+    return (seqs[i * k + min(i, m):(i + 1) * k + min(i + 1, m)] for i in range(n))
 
+########################################################################################
+# Add in some function that reads in the whichever data set
+# we are going to use here and returns that dataset as a list of sequences
+########################################################################################
 
-def get_random_indices():
-    random_indices = []
-    for cog in cog160:
-        random_indices.append(random.choice(range(len(cog) - K + 1)))
-    return random_indices
+class GibbsCalculculator(object):
 
+    def __init__(self, sequences=cog_get_data(COG160), background_model=None, current_model=None, k=K):
+        self.data_seq = sequences
+        self.background_probs = background_model if background_model \
+            else self._get_background_probabilities()
+        self.k = k
+        indices = self._get_random_indices() if not current_model \
+            else self.get_random_indices_from_model(current_model)
+        self.dict_of_seq_indices_pairs = OrderedDict(zip(self.data_seq, indices))
+        self.current_model = current_model or self.get_model(self.sequences, self.indices)
 
-def get_all_chars():
-    return sorted(list(get_background_probabilities(cog160).keys()), key=lambda c: string.ascii_uppercase.index(c))
+    def run_split_iteration(self, splits=SPLITS, max_iterations=TOTAL_SPLIT_ITERATIONS):
 
+        total_set = self._get_all_chars()
+        iteration = 0
+        last_model = None
+        while (not self.compare_models(self.current_model, last_model)) and iteration < max_iterations:
+            combined_model = [([0] * self.k) for _ in range(len(total_set))]
+            sequences_to_split = self.sequences
+            random.shuffle(sequences_to_split)
+            seq_sets = _split(sequences_to_split, splits)
+            models = []
 
-def get_model(cog, indices, k):
-    total_set = get_all_chars()
-    model =[([0] * k) for _ in range(len(total_set))]
-    subsequences = [cog_seq[index:index + k] for cog_seq, index in zip(cog, indices)]
-    for i in range(k):
-        all_at_index = [s[i] for s in subsequences]
-        for j in range(len(total_set)):
-            model[j][i] = (all_at_index.count(total_set[j]) + 1) / (len(subsequences) + len(total_set))
+            for seqs in seq_sets:
+                new_sub_calculator = GibbsCalculculator(seqs, self.background_probs,
+                                                        self.current_model if last_model else None)
+                new_sub_calculator.run_sample()
+                models.append(new_sub_calculator.current_model)
 
-    return model
+            for model in models:
+                for i in range(len(combined_model)):
+                    for j in range(len(combined_model[0])):
+                        combined_model[i][j] += model[i][j]
 
+            for i in range(len(combined_model)):
+                for j in range(len(combined_model[0])):
+                    combined_model[i][j] = combined_model[i][j] / splits
+            last_model = self.current_model
+            self.current_model = combined_model
+            self.calculate_objective_function()
+            self.write_max_prob_sequences()
+            self.write_model()
+            iteration += 1
+##################################################################################
+    def calculate_objective_function(self):
+        """
+        TODO: Use self.current_model, self.sequences and self.indices to maximise the objective function
 
-def get_distribution(sequence, model, k=K):
+        """
+        pass
+####################################################################################
+    @property
+    def indices(self):
+        return list(self.dict_of_seq_indices_pairs.values())
 
-    num_possible = len(sequence) - k + 1
-    background_set = get_all_chars()
-    background_probabilities = get_background_probabilities()
-    all_sub = []
-    for i in range(num_possible):
-        all_sub.append(sequence[i:i + k])
-    probabilities = []
-    for sub in all_sub:
-        model_generated = []
-        random_generated = []
-        for index in range(len(sub)):
-            c_index = background_set.index(sub[index])
-            random_generated.append(background_probabilities[sub[index]])
-            model_generated.append(model[c_index][index])
-        probabilities.append(prod(model_generated) / prod(random_generated))
-    return [prob / sum(probabilities) for prob in probabilities]
+    @property
+    def sequences(self):
+        return list(self.dict_of_seq_indices_pairs.keys())
 
+    @property
+    def max_probs(self):
+        probs = []
+        for seq in self.sequences:
+            dist = self.get_distribution(seq, self.current_model)
+            probs.append(max(dist))
 
-def compare_models(current_model, last_model=None, error=.01):
+        return probs
 
-    if last_model:
-        for i in range(len(current_model)):
-            for j in range(len(current_model[0])):
-                if abs(current_model[i][j] - last_model[i][j]) > error:
-                    return False
+    @property
+    def max_prob_sequences(self):
+        seqs = []
+        for seq, prob in zip(self.sequences, self.max_probs):
+            i = self.get_distribution(seq, self.current_model).index(prob)
+            seqs.append(seq[i: i + self.k])
 
-    return bool(last_model)
+        return seqs
 
-
-def run_sample(cog160, random_indices, k=K, max_iterations=200):
-
-    current_model = get_model(cog160, random_indices, k)
-    last_model = None
-    iteration = 0
-    while (not compare_models(current_model, last_model)) and iteration < max_iterations:
-        for i in range(len(random_indices)):
-
-            model = get_model(cog160[:i] + cog160[i+1:], random_indices[:i] + random_indices[i+1:], k)
-            distributions = get_distribution(cog160[i], model)
+    def get_random_indices_from_model(self, model):
+        indices = []
+        for seq in self.data_seq:
+            distributions = self.get_distribution(seq, model)
             index_choice = np.random.choice(list(range(len(distributions))), 1, p=distributions)
-            random_indices[i] = index_choice[0]
-        last_model = current_model
-        current_model = get_model(cog160, random_indices, k)
-        iteration += 1
-        print(iteration)
+            indices.append(index_choice[0])
+        return indices
 
-    return current_model, random_indices
+    def _get_background_probabilities(self):
+        string_set = "".join(self.data_seq)
+        return {c: (string_set.count(c) + 1) / (len(string_set) + 20) for c in set(list(string_set))}
+
+    def _get_random_indices(self):
+        random_indices = []
+        for seq in self.data_seq:
+            random_indices.append(random.choice(range(len(seq) - self.k + 1)))
+        return random_indices
+
+    def _get_all_chars(self):
+        return sorted(list(self._get_background_probabilities().keys()),
+                      key=lambda c: string.ascii_uppercase.index(c))
+
+    def get_model(self, seqs, indices):
+        total_set = self._get_all_chars()
+        model = [([0] * self.k) for _ in range(len(total_set))]
+        subsequences = [cog_seq[index:index + self.k] for cog_seq, index in zip(seqs, indices)]
+        for i in range(self.k):
+            all_at_index = [s[i] for s in subsequences]
+            for j in range(len(total_set)):
+                model[j][i] = (all_at_index.count(total_set[j]) + 1) / (len(subsequences) + len(total_set))
+
+        return model
+
+    def run_sample(self, max_iterations=TOTAL_ITERATIONS):
+
+        last_model = None
+        iteration = 0
+        while (not self.compare_models(self.current_model, last_model)) and iteration < max_iterations:
+            for i in range(len(self.indices)):
+                model = self.get_model(self.sequences[:i] + self.sequences[i + 1:], self.indices[:i] + self.indices[i + 1:])
+                distributions = self.get_distribution(self.sequences[i], model)
+                index_choice = np.random.choice(list(range(len(distributions))), 1, p=distributions)
+                self.dict_of_seq_indices_pairs[self.sequences[i]] = index_choice[0]
+            last_model = self.current_model
+            self.current_model = self.get_model(self.sequences, self.indices)
+            self.calculate_objective_function()
+            self.print_max_prob_sequences()
+            iteration += 1
+
+    def get_distribution(self, sequence, model):
+
+        num_possible = len(sequence) - self.k + 1
+        background_set = self._get_all_chars()
+
+        all_sub = []
+        for i in range(num_possible):
+            all_sub.append(sequence[i:i + self.k])
+        probabilities = []
+        for sub in all_sub:
+            model_generated = []
+            random_generated = []
+            for index in range(len(sub)):
+                c_index = background_set.index(sub[index])
+                random_generated.append(self.background_probs[sub[index]])
+                model_generated.append(model[c_index][index])
+            probabilities.append(prod(model_generated) / prod(random_generated))
+        return [prob / sum(probabilities) for prob in probabilities]
+
+    @staticmethod
+    def compare_models(current_model, last_model=None, error=.01):
+
+        if last_model:
+            for i in range(len(current_model)):
+                for j in range(len(current_model[0])):
+                    if abs(current_model[i][j] - last_model[i][j]) > error:
+                        return False
+
+        return bool(last_model)
+
+    def print_max_prob_sequences(self):
+        print("\n")
+        for seq in self.max_prob_sequences:
+            print(seq)
+        print("\n")
+
+    def write_max_prob_sequences(self, seq_file=SUB_SEQ_FILE):
+        with open(seq_file, "w+") as fh:
+            for seq in self.max_prob_sequences:
+                fh.write("{}\n".format(seq))
+
+    def write_model(self, model_file=MODEL_FILE):
+        with open(model_file, "w+") as fh:
+            for probs in self.current_model:
+                fh.write("{}\n".format(probs))
 
 
 if __name__ == "__main__":
-
-    cm, rm = run_sample(cog160, get_random_indices())
-    for seq, index in zip(cog160, rm):
-        print(seq[index: index + K])
-
-
-
+    gc = GibbsCalculculator()
+    gc.run_split_iteration()
 
