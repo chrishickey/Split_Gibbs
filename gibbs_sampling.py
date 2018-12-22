@@ -1,16 +1,22 @@
 import os, random, string
 import operator
 import numpy as np
+from math import log2
 from frozendict import OrderedDict
 from functools import reduce
+import threading
 BASE_DIR = os.path.join(os.path.dirname(__file__), "data_files")
 COG160 = os.path.join(BASE_DIR, "COG160.fasta")
-SUB_SEQ_FILE = os.path.join(BASE_DIR, "best_seq.txt")
-MODEL_FILE = os.path.join(BASE_DIR, "model_file.txt")
-K = 4
-SPLITS = 2
-TOTAL_SPLIT_ITERATIONS = 100
-TOTAL_ITERATIONS = 100
+COG1 = os.path.join(BASE_DIR, "COG1.fasta")
+COG161 = os.path.join(BASE_DIR, "COG161.fasta")
+SUB_SEQ_FILE = os.path.join(BASE_DIR, "best_seq{}.txt")
+MODEL_FILE = os.path.join(BASE_DIR, "model_file{}.txt")
+OBJECTIVE_FUNCTION_FILE = os.path.join(BASE_DIR, "objective_function{}.txt")
+K = 3
+SPLITS = 6
+TOTAL_SPLIT_ITERATIONS = 25
+TOTAL_ITERATIONS = 50
+
 
 def cog_get_data(cog_file):
 
@@ -27,6 +33,7 @@ def cog_get_data(cog_file):
         data_output.append(value.replace("\n", ""))
     return data_output
 
+SEQUENCES = cog_get_data(COG160) + cog_get_data(COG161) + cog_get_data(COG1)
 
 def prod(factors):
     return reduce(operator.mul, factors, 1)
@@ -43,7 +50,9 @@ def _split(seqs, n):
 
 class GibbsCalculculator(object):
 
-    def __init__(self, sequences=cog_get_data(COG160), background_model=None, current_model=None, k=K):
+    def __init__(self, sequences=SEQUENCES, background_model=None, current_model=None,
+                 k=K, total_split_iterations=TOTAL_SPLIT_ITERATIONS, total_iterations=TOTAL_ITERATIONS,
+                 identifier=""):
         self.data_seq = sequences
         self.background_probs = background_model if background_model \
             else self._get_background_probabilities()
@@ -52,24 +61,37 @@ class GibbsCalculculator(object):
             else self.get_random_indices_from_model(current_model)
         self.dict_of_seq_indices_pairs = OrderedDict(zip(self.data_seq, indices))
         self.current_model = current_model or self.get_model(self.sequences, self.indices)
+        self.total_iterations = total_iterations
+        self.total_split_iterations = total_split_iterations
+        self.identifier = identifier
+        if not current_model and self.identifier:
+            open(OBJECTIVE_FUNCTION_FILE.format("{}_{}".format(self.k, self.identifier)), "w").close()
 
-    def run_split_iteration(self, splits=SPLITS, max_iterations=TOTAL_SPLIT_ITERATIONS):
+    def run_split_iteration(self, splits=SPLITS):
 
         total_set = self._get_all_chars()
         iteration = 0
         last_model = None
-        while (not self.compare_models(self.current_model, last_model)) and iteration < max_iterations:
+        while (not self.compare_models(self.current_model, last_model)) and iteration < self.total_split_iterations:
             combined_model = [([0] * self.k) for _ in range(len(total_set))]
             sequences_to_split = self.sequences
             random.shuffle(sequences_to_split)
             seq_sets = _split(sequences_to_split, splits)
-            models = []
+            calculators = []
+            threads = []
 
             for seqs in seq_sets:
                 new_sub_calculator = GibbsCalculculator(seqs, self.background_probs,
-                                                        self.current_model if last_model else None)
-                new_sub_calculator.run_sample()
-                models.append(new_sub_calculator.current_model)
+                                                        self.current_model if last_model else None,
+                                                        k=self.k, total_iterations=self.total_iterations)
+                calculators.append(new_sub_calculator)
+                t = threading.Thread(target=lambda gc: gc.run_sample(write_result=False), args=(new_sub_calculator, ))
+                t.start()
+                threads.append(t)
+
+            for t in threads:
+                t.join()
+            models = [c.current_model for c in calculators]
 
             for model in models:
                 for i in range(len(combined_model)):
@@ -81,17 +103,23 @@ class GibbsCalculculator(object):
                     combined_model[i][j] = combined_model[i][j] / splits
             last_model = self.current_model
             self.current_model = combined_model
-            self.calculate_objective_function()
+            self.write_objective_func()
             self.write_max_prob_sequences()
             self.write_model()
             iteration += 1
+
 ##################################################################################
     def calculate_objective_function(self):
         """
         TODO: Use self.current_model, self.sequences and self.indices to maximise the objective function
-
+        # self.current_model is a 4 * 20 matrix with each position being the likelihood of the kmer appearing
+        # at that corresponding position in
         """
-        pass
+        probs_from_random = []
+        for seq in self.max_prob_sequences:
+            probs_from_random.append(
+                prod([self.background_probs[character] for character in seq]))
+        return sum([log2(maxx / rand) for maxx, rand in zip(self.max_probs, probs_from_random)])
 ####################################################################################
     @property
     def indices(self):
@@ -152,11 +180,11 @@ class GibbsCalculculator(object):
 
         return model
 
-    def run_sample(self, max_iterations=TOTAL_ITERATIONS):
+    def run_sample(self, write_result=True):
 
         last_model = None
         iteration = 0
-        while (not self.compare_models(self.current_model, last_model)) and iteration < max_iterations:
+        while (not self.compare_models(self.current_model, last_model)) and iteration < self.total_iterations:
             for i in range(len(self.indices)):
                 model = self.get_model(self.sequences[:i] + self.sequences[i + 1:], self.indices[:i] + self.indices[i + 1:])
                 distributions = self.get_distribution(self.sequences[i], model)
@@ -164,8 +192,10 @@ class GibbsCalculculator(object):
                 self.dict_of_seq_indices_pairs[self.sequences[i]] = index_choice[0]
             last_model = self.current_model
             self.current_model = self.get_model(self.sequences, self.indices)
-            self.calculate_objective_function()
-            self.print_max_prob_sequences()
+            if write_result:
+                self.write_objective_func()
+                self.write_max_prob_sequences()
+                self.write_model()
             iteration += 1
 
     def get_distribution(self, sequence, model):
@@ -205,17 +235,31 @@ class GibbsCalculculator(object):
         print("\n")
 
     def write_max_prob_sequences(self, seq_file=SUB_SEQ_FILE):
+        seq_file = seq_file.format("{}_{}".format(self.k, self.identifier))
         with open(seq_file, "w+") as fh:
             for seq in self.max_prob_sequences:
                 fh.write("{}\n".format(seq))
 
     def write_model(self, model_file=MODEL_FILE):
+        model_file = model_file.format("{}_{}".format(self.k, self.identifier))
         with open(model_file, "w+") as fh:
             for probs in self.current_model:
                 fh.write("{}\n".format(probs))
 
+    def write_objective_func(self, obj_file=OBJECTIVE_FUNCTION_FILE):
+        obj_file = obj_file.format("{}_{}".format(self.k, self.identifier))
+        with open(obj_file, "a+") as fh:
+            fh.write("{}\n".format(self.calculate_objective_function()))
+
 
 if __name__ == "__main__":
-    gc = GibbsCalculculator()
-    gc.run_split_iteration()
+
+    for k in range(3, 7):
+        for i in range(5):
+            gc = GibbsCalculculator(identifier="{}SPLIT".format(i), k=k)
+            gc.run_split_iteration()
+
+        for i in range(5):
+            gc = GibbsCalculculator(identifier="{}STANDARD".format(i), k=k, total_iterations=150)
+            gc.run_sample()
 
