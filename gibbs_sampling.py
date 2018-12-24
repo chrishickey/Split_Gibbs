@@ -254,7 +254,7 @@ class GibbsCalculculator(object):
 
 if __name__ == "__main__":
 
-    for k in range(3, 7):
+    for k in range(3, 6):
         for i in range(5):
             gc = GibbsCalculculator(identifier="{}SPLIT".format(i), k=k)
             gc.run_split_iteration()
